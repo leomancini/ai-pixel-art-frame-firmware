@@ -2,8 +2,9 @@
 
 Animation player for an Adafruit MatrixPortal M4 driving a 32×32 HUB75 LED
 matrix. Downloads complete animations over HTTPS from the
-[server](../server), plays them from RAM, and keeps an HTTP long-poll
-outstanding so new art appears within milliseconds of being pushed.
+[server](https://github.com/leomancini/ai-pixel-art-frame-server), plays
+them from RAM, and keeps an HTTP long-poll outstanding so new art appears
+within milliseconds of being pushed.
 
 ## Architecture
 
