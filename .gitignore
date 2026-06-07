@@ -1,0 +1,4 @@
+matrix_stream/secrets.h
+build/
+*.uf2
+*.bin
