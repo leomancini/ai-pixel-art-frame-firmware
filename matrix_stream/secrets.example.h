@@ -12,3 +12,10 @@
 
 #define SERVER_PATH_ANIMATION "/animation"
 #define SERVER_PATH_POLL      "/poll"
+
+// This frame's identity. Register the frame in the admin panel to get its
+// slug and one-time device key, then paste them here before flashing. Each
+// of your boards gets a DIFFERENT slug/key. FRAME_SLUG goes in the request
+// URL (?frame=...); FRAME_KEY is sent as the X-Frame-Key header.
+#define FRAME_SLUG "living-room"
+#define FRAME_KEY  "paste-the-device-key-from-the-admin-panel"

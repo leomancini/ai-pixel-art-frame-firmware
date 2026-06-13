@@ -240,6 +240,7 @@ static void sendRequest(const char *path) {
   client.print("GET ");
   client.print(path);
   client.print(" HTTP/1.1\r\nHost: " SERVER_HOST
+               "\r\nX-Frame-Key: " FRAME_KEY
                "\r\nConnection: keep-alive\r\n\r\n");
 }
 
@@ -277,7 +278,7 @@ static void fadePlayback(bool fadeIn) {
 static bool downloadAnimation(void) {
   Serial.println("Anim: downloading");
   fadePlayback(false); // fade out whatever is playing (no-op on first boot)
-  sendRequest(SERVER_PATH_ANIMATION);
+  sendRequest(SERVER_PATH_ANIMATION "?frame=" FRAME_SLUG);
   long contentLength;
   bool willClose;
   if (!readHttpHeaders(&contentLength, &willClose)) return false;
@@ -390,9 +391,9 @@ void loop(void) {
 
   // keep exactly one long-poll outstanding
   if (!pollOutstanding && client.connected()) {
-    char path[64];
-    snprintf(path, sizeof(path), "%s?id=%lu", SERVER_PATH_POLL,
-             (unsigned long)animId);
+    char path[160]; // room for the slug + key-less query
+    snprintf(path, sizeof(path), "%s?frame=%s&id=%lu", SERVER_PATH_POLL,
+             FRAME_SLUG, (unsigned long)animId);
     sendRequest(path);
     pollOutstanding = true;
     pollSentAt = millis();

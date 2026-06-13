@@ -1,4 +1,9 @@
 matrix_stream/secrets.h
+matrix_stream/secrets.*.h
 build/
 *.uf2
 *.bin
+
+# …but DO vendor the NINA co-processor firmware image used to update the
+# AirLift's TLS root bundle (see tools/ and docs/PROVISIONING.md).
+!tools/NINA_W102-*.bin
