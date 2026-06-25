@@ -173,9 +173,13 @@ static void connectWiFi(void) {
 
 // Cheap stall detector; client.connected() costs an SPI round trip, so it
 // is queried at most every 250ms and only once the stream has gone quiet.
+// A genuinely closed socket is caught within ~250ms by the client.connected()
+// check below; the long hard cap only fires when the socket still reports
+// connected but delivers nothing — a transient cellular stall we'd rather ride
+// out than abort on (aborting mid-download forced a reconnect + re-download).
 static bool streamDead(uint32_t lastData) {
   uint32_t quiet = millis() - lastData;
-  if (quiet > 5000) return true;
+  if (quiet > 20000) return true;
   if (quiet > 250) {
     static uint32_t lastCheck = 0;
     if (millis() - lastCheck > 250) {
@@ -377,8 +381,14 @@ void loop(void) {
       delay(1000);
       return;
     }
-    if (frameCount == 0 || !pollOutstanding) {
-      // fresh connection: fetch (or re-fetch) the animation
+    if (frameCount == 0) {
+      // First boot only: we have nothing to show, so fetch the animation now.
+      // On a *reconnect* with art already in RAM we deliberately skip the
+      // download — the cellular link drops connections routinely, and
+      // re-fetching unchanged frames just froze the last frame and re-ran the
+      // loading ring for no reason. Instead we keep playing what we have and
+      // fall through to the poll below; if the id moved while we were away the
+      // server answers immediately and the normal poll path re-downloads.
       if (!downloadAnimation()) {
         client.stop();
         startConnecting();
