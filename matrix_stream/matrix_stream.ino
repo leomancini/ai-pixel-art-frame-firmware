@@ -6,6 +6,11 @@
 // within milliseconds. This sidesteps the ESP32's ~25KB/s TLS throughput
 // limit: downloads may take a few seconds, but playback is local.
 //
+// Everything on the panel — playback, fades, loading rings — is drawn from
+// a timer interrupt, never from loop(). WiFiNINA calls block the main
+// thread for seconds at a time (TLS handshakes on reconnect, client.stop()
+// waiting for a close, stalled reads), and playback must not freeze then.
+//
 // Server endpoints (all responses use Content-Length, never chunked):
 //   GET /animation     -> ANM0, uint32 id, uint16 frameCount, uint16 delayMs,
 //                         then frameCount * 2048 bytes RGB565 LE pixels
@@ -49,8 +54,19 @@ uint32_t animId = 0;
 
 bool pollOutstanding = false;
 uint32_t pollSentAt = 0;
-uint16_t playIdx = 0;
-uint32_t lastFrameAt = 0;
+
+// Playback state, owned by the timer ISR while `playing` is set. The main
+// thread only touches it (and frames[]) after clearing `playing`; the ISR
+// can't be mid-draw at that point since it preempts the main thread, never
+// the reverse.
+volatile bool playing = false;
+volatile uint16_t playIdx = 0;       // frame currently on the panel
+volatile uint32_t nextFrameAt = 0;   // millis() deadline for the next frame
+volatile int16_t playBright = 0;     // 0..255, stepped toward the target
+volatile int16_t playBrightTarget = 0;
+volatile uint32_t nextFadeAt = 0;
+#define FADE_STEP 16     // brightness per step: ~320ms for a full fade
+#define FADE_STEP_MS 20
 
 // Shared progress indicator: a 1px trace around the screen perimeter,
 // running clockwise from the top-left corner.
@@ -101,22 +117,101 @@ volatile int16_t progressShown = 0;
 volatile int16_t progressBright = 0;
 volatile int16_t connectBright = 0;
 
-// Enable the connecting sweep, fading it in from black (no-op if already on)
+// Enable the connecting sweep, fading it in from black (no-op if already on,
+// or while an animation is playing — reconnects stay invisible then)
 static void startConnecting(void) {
-  if (!connectingAnim) {
+  if (!connectingAnim && !playing) {
     connectBright = 0;
     connectingAnim = true;
   }
 }
 
 static void drawConnecting(void) {
-  if (frameCount > 0) return; // keep showing the animation we have
   // 16px segment chasing clockwise around the perimeter
   drawPerimSpan((millis() / 25) % PERIM, 16, connectBright);
 }
 
+// Draw a playback frame brightness-scaled (255 = as-is)
+static void drawFrameScaled(const uint16_t *frame, uint8_t bright) {
+  if (bright == 255) {
+    matrix.drawRGBBitmap(0, 0, frame, WIDTH, HEIGHT);
+    matrix.show();
+    return;
+  }
+  static uint16_t tmp[FRAME_PIXELS];
+  uint32_t f = bright + 1; // 1..256 so we can shift instead of divide
+  for (int i = 0; i < FRAME_PIXELS; i++) {
+    uint16_t p = frame[i];
+    tmp[i] = ((((p >> 11) * f) >> 8) << 11) |
+             (((((p >> 5) & 0x3F) * f) >> 8) << 5) |
+             (((p & 0x1F) * f) >> 8);
+  }
+  matrix.drawRGBBitmap(0, 0, tmp, WIDTH, HEIGHT);
+  matrix.show();
+}
+
+// Playback tick (ISR): advance the frame and/or the fade when due.
+static void playbackTick(void) {
+  uint32_t now = millis();
+  bool redraw = false;
+  if (playBright != playBrightTarget && (int32_t)(now - nextFadeAt) >= 0) {
+    int16_t b = playBright;
+    if (b < playBrightTarget) {
+      b += FADE_STEP;
+      if (b > playBrightTarget) b = playBrightTarget;
+    } else {
+      b -= FADE_STEP;
+      if (b < playBrightTarget) b = playBrightTarget;
+    }
+    playBright = b;
+    nextFadeAt = now + FADE_STEP_MS;
+    redraw = true; // the animation keeps advancing through the fade
+  }
+  if ((int32_t)(now - nextFrameAt) >= 0) {
+    playIdx = (playIdx + 1) % frameCount;
+    // schedule from the deadline, not from now, so tick jitter doesn't
+    // accumulate into a slower animation; resync if we fell far behind
+    nextFrameAt += frameDelayMs;
+    if ((int32_t)(now - nextFrameAt) >= 0) nextFrameAt = now + frameDelayMs;
+    redraw = true;
+  }
+  if (redraw) drawFrameScaled(frames[playIdx], (uint8_t)playBright);
+}
+
+// Start (or resume) playing frames[] from the top, fading in from black.
+static void startPlayback(void) {
+  if (frameCount == 0) return;
+  connectingAnim = false;
+  playIdx = frameCount - 1; // first tick advances to frame 0
+  playBright = 0;
+  playBrightTarget = 255;
+  nextFrameAt = nextFadeAt = millis();
+  playing = true;
+}
+
+// Fade the playing animation out to black, then release frames[] to the
+// main thread.
+static void stopPlayback(void) {
+  if (!playing) return;
+  playBrightTarget = 0;
+  uint32_t start = millis();
+  while (playBright > 0 && millis() - start < 1000) delay(5);
+  playing = false;
+}
+
+// Ring animations step at ~60Hz, every RING_DIV-th tick of the ~960Hz timer
+#define TICK_HZ 960
+#define RING_DIV 16
+
 void TC3_Handler(void) {
   TC3->COUNT16.INTFLAG.reg = TC_INTFLAG_OVF;
+  if (playing) {
+    playbackTick();
+    return;
+  }
+  static uint8_t div = 0;
+  if (++div < RING_DIV) return;
+  div = 0;
   if (connectingAnim) {
     if (connectBright < RING_BRIGHT) {
       connectBright += 3; // fade in
@@ -139,18 +234,21 @@ void TC3_Handler(void) {
   }
 }
 
-// TC3 at ~20Hz. Priority is set below Protomatter's refresh timer so the
-// panel can still refresh (and complete show()'s buffer swap) while our
-// handler runs.
+// TC3 at ~960Hz, fine enough that frame timing has no visible jitter (the
+// handler returns immediately on ticks with nothing to draw). Priority is
+// set below Protomatter's refresh timer so the panel can still refresh (and
+// complete show()'s buffer swap) while our handler runs. SysTick is raised
+// above us — the core leaves it near the bottom, where millis() would lose
+// time during every multi-millisecond draw and playback would run slow.
 static void setupAnimTimer(void) {
+  NVIC_SetPriority(SysTick_IRQn, 2);
   GCLK->PCHCTRL[TC3_GCLK_ID].reg = GCLK_PCHCTRL_GEN_GCLK0 | GCLK_PCHCTRL_CHEN;
   while (!(GCLK->PCHCTRL[TC3_GCLK_ID].reg & GCLK_PCHCTRL_CHEN));
   TC3->COUNT16.CTRLA.bit.ENABLE = 0;
   while (TC3->COUNT16.SYNCBUSY.bit.ENABLE);
   TC3->COUNT16.CTRLA.reg = TC_CTRLA_MODE_COUNT16 | TC_CTRLA_PRESCALER_DIV1024;
   TC3->COUNT16.WAVE.reg = TC_WAVE_WAVEGEN_MFRQ;
-  TC3->COUNT16.CC[0].reg = F_CPU / 1024 / 60; // ~60Hz: 1px/tick ring growth
-                                              // outpaces the ~30px/s download
+  TC3->COUNT16.CC[0].reg = F_CPU / 1024 / TICK_HZ;
   while (TC3->COUNT16.SYNCBUSY.bit.CC0);
   TC3->COUNT16.INTENSET.reg = TC_INTENSET_OVF;
   NVIC_SetPriority(TC3_IRQn, 3);
@@ -248,40 +346,7 @@ static void sendRequest(const char *path) {
                "\r\nConnection: keep-alive\r\n\r\n");
 }
 
-// Draw a playback frame brightness-scaled (255 = as-is)
-static void drawFrameScaled(const uint16_t *frame, uint8_t bright) {
-  static uint16_t tmp[FRAME_PIXELS];
-  uint32_t f = bright + 1; // 1..256 so we can shift instead of divide
-  for (int i = 0; i < FRAME_PIXELS; i++) {
-    uint16_t p = frame[i];
-    tmp[i] = ((((p >> 11) * f) >> 8) << 11) |
-             (((((p >> 5) & 0x3F) * f) >> 8) << 5) |
-             (((p & 0x1F) * f) >> 8);
-  }
-  matrix.drawRGBBitmap(0, 0, tmp, WIDTH, HEIGHT);
-  matrix.show();
-}
-
-// Fade playback in or out over ~320ms; the animation keeps advancing
-// through the fade so it reads as a transition, not a freeze.
-static void fadePlayback(bool fadeIn) {
-  if (frameCount == 0) return;
-  for (int step = 0; step <= 16; step++) {
-    int v = step * 16;
-    if (v > 255) v = 255;
-    uint8_t bright = fadeIn ? v : 255 - v;
-    if (millis() - lastFrameAt >= frameDelayMs) {
-      lastFrameAt = millis();
-      playIdx = (playIdx + 1) % frameCount;
-    }
-    drawFrameScaled(frames[playIdx], bright);
-    delay(20);
-  }
-}
-
-static bool downloadAnimation(void) {
-  Serial.println("Anim: downloading");
-  fadePlayback(false); // fade out whatever is playing (no-op on first boot)
+static bool fetchAnimation(void) {
   sendRequest(SERVER_PATH_ANIMATION "?frame=" FRAME_SLUG);
   long contentLength;
   bool willClose;
@@ -326,9 +391,7 @@ static bool downloadAnimation(void) {
   animId = id;
   frameCount = count;
   frameDelayMs = delayMs;
-  playIdx = 0;
-  lastFrameAt = millis();
-  fadePlayback(true); // fade the new animation in
+  startPlayback(); // fade the new animation in
   if (willClose) client.stop();
   Serial.print("Anim: id=");
   Serial.print(id);
@@ -337,6 +400,16 @@ static bool downloadAnimation(void) {
   Serial.print(" delay=");
   Serial.println(delayMs);
   return true;
+}
+
+static bool downloadAnimation(void) {
+  Serial.println("Anim: downloading");
+  stopPlayback(); // fade out whatever is playing (no-op on first boot)
+  bool ok = fetchAnimation();
+  // Failed before the buffer was touched (e.g. the connection died during
+  // the request)? The old animation is still intact — bring it back.
+  if (!ok && frameCount > 0) startPlayback();
+  return ok;
 }
 
 // Read the tiny long-poll response; returns the reported id, or 0 on error.
@@ -427,13 +500,6 @@ void loop(void) {
     client.stop();
     pollOutstanding = false;
   }
-
-  // ── playback ──
-  if (frameCount > 0 && millis() - lastFrameAt >= frameDelayMs) {
-    lastFrameAt = millis();
-    if (playIdx >= frameCount) playIdx = 0;
-    matrix.drawRGBBitmap(0, 0, frames[playIdx], WIDTH, HEIGHT);
-    matrix.show();
-    playIdx = (playIdx + 1) % frameCount;
-  }
+  // Playback isn't here: the timer ISR draws it (see playbackTick), so it
+  // keeps running through everything above that blocks.
 }

@@ -17,11 +17,12 @@ to stream frames live. Instead the board:
 3. Keeps `GET /poll?id=N` outstanding on the same keep-alive connection;
    the server holds it (~20 s max) until the animation changes
 
-All loading states render as a dim 1 px ring around the panel edge —
-a chasing segment while connecting, a clockwise fill while downloading —
-driven from a TC3 timer ISR at 60 Hz so they animate even while the main
-thread is blocked inside WiFiNINA calls. Animations fade in/out on every
-transition.
+Everything on the panel is drawn from a TC3 timer ISR, never from `loop()`,
+so it keeps moving while the main thread is blocked inside WiFiNINA calls
+(TLS handshakes on reconnect, `client.stop()`, stalled reads). That covers
+playback itself, the fade in/out on every transition, and the loading
+states: a dim 1 px ring around the panel edge — a chasing segment while
+connecting, a clockwise fill while downloading.
 
 ## Frame identity
 
