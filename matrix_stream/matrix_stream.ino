@@ -206,6 +206,11 @@ static void stopPlayback(void) {
 void TC3_Handler(void) {
   TC3->COUNT16.INTFLAG.reg = TC_INTFLAG_OVF;
   if (playing) {
+    // Never draw while the main thread is mid-transaction with the ESP32
+    // (chip select low): a multi-millisecond pause there desynchronises the
+    // WiFiNINA SPI protocol for good. Deadlines are absolute, so the frame
+    // just lands on a later tick, at most a transaction (~1ms) late.
+    if (digitalRead(SPIWIFI_SS) == LOW) return;
     playbackTick();
     return;
   }
