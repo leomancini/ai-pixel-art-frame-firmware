@@ -17,6 +17,28 @@ Re-flashed **MUGUZO (`frame-005`)** with the firmware at commit `dc7d693`
   Each time the board logged `Poll: new animation N` and finished downloading
   about 3 s later; the panel visibly changed.
 
+### `dc7d693` was broken — flash `1423280` or later
+
+Shortly after, MUGUZO stopped responding to animation changes while still
+playing its current one. Serial showed `Server: connecting`,
+`No Socket available`, then `WiFi: connecting to ...` repeating forever.
+
+Cause: `dc7d693` draws frames from a timer interrupt, and a draw landing in the
+middle of an SPI transaction with the WiFi chip knocked the two out of sync for
+good. It's intermittent — it survived over a minute in the first test, then
+died 7 s after playback started in the next.
+
+Fix: commit `1423280` skips the draw while the WiFi chip's chip select is low.
+With it, MUGUZO ran 6+ minutes and took ~10 changes in a row without a miss.
+That's the only soak it has had, so:
+
+- **Never flash `dc7d693`.** Make sure the checkout is at `1423280` or later
+  (`git pull`) before flashing the studio boards.
+- After flashing each board, don't stop at one push test. Leave it a few
+  minutes and change the animation several times.
+- If a board plays fine but ignores changes, that's this bug again — grab the
+  serial log before power-cycling it.
+
 ## Still on the old firmware
 
 The other registered frames, none of which have been re-flashed:
@@ -69,8 +91,9 @@ time**:
    to see `WiFi: connected`, `ESP32 NINA firmware: 1.7.x`, then `Anim: id=...`.
 
 6. **Push test:** change the frame's animation from the web app (or the MCP
-   `show_animation`) and watch the panel switch within a few seconds. Put it
-   back to what it was showing.
+   `show_animation`) and watch the panel switch within a few seconds. Repeat
+   several times over a few minutes (see the `dc7d693` section above), then
+   put it back to what it was showing.
 
 ## Gotchas
 
